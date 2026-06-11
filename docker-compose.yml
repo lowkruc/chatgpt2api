@@ -1,0 +1,29 @@
+services:
+  app:
+    image: ghcr.io/basketikun/chatgpt2api:latest
+    container_name: chatgpt2api
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      # Storage backend config (options: json, sqlite, postgres, git)
+       - STORAGE_BACKEND=json
+      
+      # Database config (used when STORAGE_BACKEND=sqlite/postgres)
+      # - DATABASE_URL=postgresql://user:password@host:5432/dbname
+      # - DATABASE_URL=sqlite:///app/data/accounts.db
+      
+      # Git repository config (used when STORAGE_BACKEND=git)
+      # - GIT_REPO_URL=https://github.com/user/repo.git
+      # - GIT_TOKEN=ghp_xxxxxxxxxxxx
+      # - GIT_BRANCH=main
+      # - GIT_FILE_PATH=accounts.json
+      
+      # Auth key (optional, overrides config.json)
+      # - CHATGPT2API_AUTH_KEY=your_secret_key
+      
+      # Base URL (optional)
+      # - CHATGPT2API_BASE_URL=https://your-domain.com
