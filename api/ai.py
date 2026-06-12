@@ -41,6 +41,12 @@ class ChatCompletionRequest(BaseModel):
     modalities: list[str] | None = None
     messages: list[dict[str, object]] | None = None
 
+class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    model: str | None = None
+    prompt: str | list[str] | None = None
+    stream: bool | None = None
+
 
 class ResponseCreateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -132,6 +138,16 @@ def create_router() -> APIRouter:
         )
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)
+
+    @router.post("/v1/completions")
+    async def create_completion(body: CompletionRequest, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        payload = body.model_dump(mode="python")
+        model = str(payload.get("model") or "auto")
+        request_preview = request_text(payload.get("prompt"))
+        call = LoggedCall(identity, "/v1/completions", model, "Text completion", request_text=request_preview)
+        await filter_or_log(call, request_preview)
+        return await call.run(openai_v1_chat_complete.completions_handle, payload)
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):

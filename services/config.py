@@ -465,6 +465,15 @@ class ConfigStore:
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
 
+    def get_agent_protocol_settings(self) -> dict[str, object]:
+        raw = self.data.get("agent_protocol")
+        value = raw if isinstance(raw, dict) else {}
+        return {
+            "system_prompt_override": str(value.get("system_prompt_override") or "").strip(),
+            "extra_rules": str(value.get("extra_rules") or "").strip(),
+            "retry_enabled": bool(value.get("retry_enabled", True)),
+        }
+
     def get_storage_backend(self) -> StorageBackend:
         """Get the storage backend instance (singleton)."""
         if self._storage_backend is None:

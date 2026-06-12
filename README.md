@@ -84,7 +84,8 @@ environment:
 - Compatible `POST /v1/images/generations` image-generation endpoint
 - Compatible `POST /v1/images/edits` image-editing endpoint
 - Compatible `POST /v1/chat/completions` for image scenarios
-- Compatible `POST /v1/responses` for image scenarios
+- Compatible `POST /v1/completions` legacy text-completion endpoint
+- Compatible `POST /v1/responses` for text responses, image-generation tool calls, JSON mode hints, and lightweight function-call output parsing
 - `GET /v1/models` returns `gpt-image-2`, `codex-gpt-image-2`, `auto`, `gpt-5`, `gpt-5-1`, `gpt-5-2`, `gpt-5-3`, `gpt-5-3-mini`,
   `gpt-5-mini`
 - Supports returning multiple results via `n`
@@ -119,7 +120,7 @@ environment:
 ### Experimental / planned
 
 - `/v1/complete` text completion and streaming output are implemented but still being tested; currently there is a conversation-repetition issue, so test with caution
-- The `/v1/chat/completions` text path supports short-TTL caching, duplicate-request merging, and adjacent duplicate-message cleanup, adjustable via `chat_completion_cache`
+- The `/v1/chat/completions` and `/v1/responses` text paths support short-TTL caching, duplicate-request merging, adjacent duplicate-message cleanup, JSON mode hints, developer/tool role normalization, and lightweight tool-call JSON parsing, adjustable via `chat_completion_cache`
 - For detailed status, see: [Feature list](./docs/feature-status.en.md)
 
 ## Showcase
@@ -288,10 +289,29 @@ curl http://localhost:8000/v1/chat/completions \
 </details>
 
 <details>
+<summary><code>POST /v1/completions</code></summary>
+<br>
+
+Legacy text-completions compatibility endpoint. The server maps `prompt` to a single user chat message and returns an OpenAI-style text completion response.
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <auth-key>" \
+  -d '{
+    "model": "auto",
+    "prompt": "Briefly explain Docker Compose"
+  }'
+```
+
+<br>
+</details>
+
+<details>
 <summary><code>POST /v1/responses</code></summary>
 <br>
 
-A Responses API-compatible endpoint for image-generation tool calls, not a full general-purpose Responses API proxy.
+A Responses API-compatible endpoint for text responses, image-generation tool calls, JSON-mode hints, and lightweight function-call output parsing.
 
 ```bash
 curl http://localhost:8000/v1/responses \
@@ -315,8 +335,8 @@ curl http://localhost:8000/v1/responses \
 | Field    | Description                                          |
 |:---------|:----------------------------------------------------|
 | `model`  | The model field is echoed in the response, but image generation still uses the image-generation compatibility logic |
-| `input`  | Input content; must allow parsing the image-generation prompt |
-| `tools`  | Must include the `image_generation` tool request    |
+| `input`  | Input content; text messages, response content parts, and function-call output items are accepted |
+| `tools`  | Use `image_generation` for image output, or function tools for lightweight tool-call parsing |
 | `stream` | Implemented, but still being tested                 |
 
 <br>

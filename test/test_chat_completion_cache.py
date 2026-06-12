@@ -226,7 +226,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual("".join(deltas), "Repo: chatgpt2api done.")
         self.assertFalse(any("\ue200" in delta or "\ue202" in delta or "\ue201" in delta for delta in deltas))
 
-    def test_responses_tools_add_honest_no_tool_guard(self) -> None:
+    def test_responses_tools_add_tool_call_hint(self) -> None:
         model, messages = openai_v1_response.text_response_parts({
             "model": "auto",
             "input": "run echo hi",
@@ -235,7 +235,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertEqual(model, "auto")
         self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("cannot execute local tools", str(messages[0]["content"]))
+        self.assertIn("tool_calls", str(messages[0]["content"]))
 
     def test_chat_completions_accepts_remote_image_url(self) -> None:
         class FakeImageResponse:
