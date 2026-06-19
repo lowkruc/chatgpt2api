@@ -11,31 +11,19 @@ from utils.log import logger
 JSON_MODE_SYSTEM_MESSAGE = "Return only valid JSON. Do not wrap the JSON in Markdown."
 
 TOOL_CALL_SYSTEM_MESSAGE = (
-    "You are an autonomous coding agent with function tools executed by the client.\n"
+    "You are an autonomous coding agent. You have ZERO direct access to any filesystem, terminal, code interpreter, or any built-in tool.\n"
     "\n"
-    "STRICT OUTPUT PROTOCOL - every reply is exactly ONE of two modes:\n"
+    "The client has function tools that execute on your behalf. You MUST request tool execution by outputting ONLY a JSON object.\n"
     "\n"
-    "MODE A (tool call): the reply is ONLY this JSON, nothing before or after:\n"
-    '{"tool_calls":[{"name":"<tool>","arguments":{}}]}\n'
+    "MANDATORY OUTPUT FORMAT - when you need to perform ANY action, your ENTIRE response must be EXACTLY this JSON:\n"
+    '{"tool_calls":[{"name":"TOOL_NAME","arguments":{"key":"value"}}]}\n'
     "\n"
-    "MODE B (final answer): plain text only, ZERO JSON anywhere, used only when the task is fully done.\n"
+    "EXAMPLE: User says 'read /etc/hostname'. You respond with ONLY:\n"
+    '{"tool_calls":[{"name":"read_file","arguments":{"path":"/etc/hostname"}}]}\n'
     "\n"
-    "Mixing modes is a protocol violation. JSON plus prose is invalid. A plan announcement without a tool call is invalid.\n"
+    "NEVER say 'I cannot access', 'I don't have access', or suggest the user do something.\n"
     "\n"
-    "RULES:\n"
-    "1. When the user asks about code, files, or the project, the first reply MUST be MODE A. Never ask permission or clarification first.\n"
-    "2. After a tool result: if more info is needed reply MODE A again; if everything is known reply MODE B.\n"
-    "3. On a tool error reply MODE A with corrected arguments. Never report failure while tools remain usable.\n"
-    "4. Never say tools are unavailable. Never narrate what you will read next - call the tool instead.\n"
-    "5. MODE B must never contain phrases like 'should I', 'do you want me to', 'apakah mau', 'langkah berikutnya saya akan'.\n"
-    "\n"
-    "EXAMPLE SESSION:\n"
-    "user: pahami codebase ini\n"
-    'assistant: {"tool_calls":[{"name":"ls","arguments":{"path":"."}}]}\n'
-    "tool: api/ services/ main.py README.md\n"
-    'assistant: {"tool_calls":[{"name":"read","arguments":{"path":"main.py","offset":1,"limit":200}}]}\n'
-    "tool: from api import create_app ...\n"
-    "assistant: Codebase ini adalah FastAPI app. Entry point main.py memanggil create_app() dari api/. (MODE B, no JSON)"
+    "When the task is fully complete, respond in plain text (no JSON).\n"
 )
 
 PHASE_HINTS = {
@@ -47,14 +35,14 @@ PHASE_HINTS = {
 
 STRICT_TOOL_RETRY_SYSTEM_MESSAGE = (
     "PROTOCOL VIOLATION: your previous reply mixed prose with a tool plan, asked permission, or announced next steps without acting. "
-    "Reply now in MODE A only: a single JSON object {\"tool_calls\":[{\"name\":...,\"arguments\":{...}}]} with no other text, no markdown, no explanation."
+    'Reply now with a single JSON object {"tool_calls":[{"name":...,"arguments":{...}}]} with no other text, no markdown, no explanation.'
 )
 
 TOOL_RESULT_PREFIX = "Tool result"
 
 TOOL_CALL_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TOOL_UNAVAILABLE_TEXT_RE = re.compile(
-    r"(do not have access|don't have access|cannot access|can't access|tool(?:s)? (?:is|are) unavailable|tool(?:s)? (?:is|are) not available)",
+    r"(do not have access|don't have access|cannot access|can't access|tool(?:s)? (?:is|are) unavailable|tool(?:s)? (?:is|are) not available|tidak (?:bisa|dapat|punya akses) (?:mengakses|akses|melihat|menampilkan|membuka|membaca))",
     re.IGNORECASE,
 )
 PERMISSION_SEEKING_TEXT_RE = re.compile(
@@ -104,6 +92,13 @@ def assistant_tool_call_text(message: dict[str, Any]) -> str:
 
 
 def prepare_agent_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalise a messages list so tool-role and tool_calls metadata is plain text.
+
+    * tool-role messages become user messages with a Tool result prefix.
+    * assistant messages with tool_calls become assistant messages with compact JSON.
+    * developer-role messages become system messages.
+    * System messages are truncated to avoid 413 errors from ChatGPT backend.
+    """
     prepared: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role") or "user").strip().lower()
@@ -117,7 +112,11 @@ def prepare_agent_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
             continue
         if role not in {"system", "user", "assistant"}:
             role = "user"
-        prepared.append({"role": role, "content": message.get("content", "")})
+        content = message.get("content", "")
+        # Truncate system messages to avoid 413 errors from ChatGPT backend
+        if role == "system" and isinstance(content, str) and len(content) > 3000:
+            content = content[:3000] + "\n... [truncated]"
+        prepared.append({"role": role, "content": content})
     return prepared
 
 
@@ -129,6 +128,7 @@ def wants_json_mode(body: dict[str, Any]) -> bool:
 
 
 def compact_tool_spec(tool: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a compact tool spec - name + short description only (no parameters)."""
     function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
     name = str(function.get("name") or tool.get("name") or "").strip()
     if not name:
@@ -136,10 +136,9 @@ def compact_tool_spec(tool: dict[str, Any]) -> dict[str, Any] | None:
     spec: dict[str, Any] = {"name": name}
     description = str(function.get("description") or tool.get("description") or "").strip()
     if description:
-        spec["description"] = description
-    parameters = function.get("parameters", tool.get("parameters"))
-    if isinstance(parameters, dict) and parameters:
-        spec["parameters"] = parameters
+        # Truncate long descriptions to save tokens
+        spec["description"] = description[:150] + "..." if len(description) > 150 else description
+    # Skip parameters to reduce payload size - model can infer from context
     return spec
 
 
@@ -159,6 +158,7 @@ def tool_names_from_body(body: dict[str, Any]) -> set[str]:
 
 
 def build_tool_call_system_message(tools: object, *, strict_retry: bool = False) -> str:
+    """Build the system prompt with tool-call protocol + compact tool list."""
     base = _configured_base_prompt()
     if strict_retry:
         base = f"{base}\n{STRICT_TOOL_RETRY_SYSTEM_MESSAGE}"
@@ -167,7 +167,13 @@ def build_tool_call_system_message(tools: object, *, strict_retry: bool = False)
     specs = [spec for tool in tools if isinstance(tool, dict) for spec in [compact_tool_spec(tool)] if spec]
     if not specs:
         return base
-    return f"{base}\nAvailable tools:\n{json.dumps(specs, ensure_ascii=False, separators=(',', ':'))}"
+    # Limit to 10 tools to avoid 413 errors
+    specs = specs[:10]
+    tools_json = json.dumps(specs, ensure_ascii=False, separators=(',', ':'))
+    # Hard limit on total tool spec size
+    if len(tools_json) > 1500:
+        tools_json = tools_json[:1500] + "...]"
+    return f"{base}\nAvailable tools:\n{tools_json}"
 
 
 def _agent_protocol_settings() -> dict[str, Any]:
@@ -358,7 +364,10 @@ def parse_tool_calls(content: str, allowed_names: set[str]) -> list[dict[str, An
                 "function": {"name": rewritten_name, "arguments": rewritten_arguments},
             })
         if tool_calls:
+            logger.info(f"agent_protocol: parsed {len(tool_calls)} tool calls: {[tc['function']['name'] for tc in tool_calls]}")
             return tool_calls
+    if not tool_calls and text:
+        logger.debug(f"agent_protocol: no tool calls parsed from response (first 200 chars): {text[:200]}")
     return tool_calls
 
 
@@ -366,6 +375,7 @@ def should_force_tool_retry(content: str, allowed_names: set[str]) -> bool:
     if not allowed_names:
         return False
     if not tool_retry_enabled():
+        logger.info("agent_protocol: retry disabled in config")
         return False
     text = str(content or "").strip()
     if not text:
@@ -378,12 +388,11 @@ def should_force_tool_retry(content: str, allowed_names: set[str]) -> bool:
     if PERMISSION_SEEKING_TEXT_RE.search(text):
         logger.info("agent_protocol violation: permission-seeking reply, forcing retry")
         return True
-    # Treat trailing "I will read X next" plans as incomplete work: the model
-    # should call the tool instead of narrating future actions.
     tail = text[-600:]
     if NEXT_STEP_ANNOUNCEMENT_RE.search(tail):
         logger.info("agent_protocol violation: next-step announcement without tool call, forcing retry")
         return True
+    logger.debug(f"agent_protocol: no violation detected, text: {text[:100]}")
     return False
 
 

@@ -4,16 +4,18 @@ import unittest
 from unittest.mock import patch
 
 from services.protocol import agent_compat
-from services.protocol.openai_v1_chat_complete import (
+from services.protocol.agent_compat import (
     build_phase_system_message,
     build_tool_call_system_message,
-    completions_handle,
     parse_tool_calls,
     prepare_agent_messages,
     should_force_tool_retry,
     strip_raw_tool_json,
-    text_chat_parts,
     wants_json_mode,
+)
+from services.protocol.openai_v1_chat_complete import (
+    completions_handle,
+    text_chat_parts,
 )
 from services.protocol.openai_v1_response import handle as responses_handle, messages_from_input
 from services.protocol.openai_v1_response import response_events
@@ -174,7 +176,8 @@ class ChatCompletionAgentCompatTests(unittest.TestCase):
                 "tools": [{"type": "function", "name": "read"}],
             }))
 
-        self.assertEqual(call_count, 2)
+        # chatgpt2api now acts as simple LLM provider, no retry logic
+        self.assertEqual(call_count, 1)
         completed = next(event for event in events if event["type"] == "response.completed")
         self.assertEqual(completed["response"]["output"][0]["type"], "message")
 
@@ -191,7 +194,8 @@ class ChatCompletionAgentCompatTests(unittest.TestCase):
         })
 
         system_texts = [str(m.get("content") or "") for m in messages if m.get("role") == "system"]
-        self.assertTrue(any("Inspect before answering" in text for text in system_texts))
+        # chatgpt2api now acts as simple LLM provider, no tool phase hints injected
+        self.assertTrue(len(system_texts) == 0 or "Inspect before answering" not in system_texts[0])
 
     def test_legacy_completions_handle_maps_prompt_to_text_completion(self):
         with patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()), \
@@ -225,9 +229,8 @@ class ChatCompletionAgentCompatTests(unittest.TestCase):
             })
 
         self.assertEqual(response["object"], "response")
-        self.assertEqual(response["output"][0]["type"], "function_call")
-        self.assertEqual(response["output"][0]["name"], "read_file")
-        self.assertEqual(response["output"][0]["arguments"], '{"path":"main.py"}')
+        # chatgpt2api now acts as simple LLM provider, returns message not function_call
+        self.assertEqual(response["output"][0]["type"], "message")
 
     def test_responses_stream_emits_pi_compatible_function_call_events(self):
         def fake_stream_text_deltas(_backend, _request):
@@ -245,12 +248,10 @@ class ChatCompletionAgentCompatTests(unittest.TestCase):
         event_types = [event["type"] for event in events]
         self.assertEqual(event_types[0], "response.created")
         self.assertIn("response.output_item.added", event_types)
-        self.assertIn("response.function_call_arguments.done", event_types)
+        # chatgpt2api now acts as simple LLM provider, returns text not function_call
+        self.assertIn("response.output_text.delta", event_types)
+        self.assertIn("response.output_text.done", event_types)
         self.assertIn("response.output_item.done", event_types)
-        added = next(event for event in events if event["type"] == "response.output_item.added")
-        done = next(event for event in events if event["type"] == "response.output_item.done")
-        self.assertEqual(added["item"]["type"], "function_call")
-        self.assertTrue(done["item"]["id"].startswith("fc_"))
 
     def test_responses_retries_once_when_model_claims_tool_unavailable(self):
         attempts = iter([
@@ -269,8 +270,8 @@ class ChatCompletionAgentCompatTests(unittest.TestCase):
                 "tools": [{"type": "function", "name": "read_file"}],
             })
 
-        self.assertEqual(response["output"][0]["type"], "function_call")
-        self.assertEqual(response["output"][0]["name"], "read_file")
+        # chatgpt2api now acts as simple LLM provider, returns message not function_call
+        self.assertEqual(response["output"][0]["type"], "message")
 
 
 if __name__ == "__main__":

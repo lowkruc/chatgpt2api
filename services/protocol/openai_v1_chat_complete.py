@@ -9,15 +9,15 @@ from fastapi import HTTPException
 
 from services.protocol.agent_compat import (
     JSON_MODE_SYSTEM_MESSAGE,
-    build_phase_system_message,
     build_tool_call_system_message,
-    parse_tool_calls,
     prepare_agent_messages,
+    parse_tool_calls,
     should_force_tool_retry,
     strip_raw_tool_json,
     tool_names_from_body,
     wants_json_mode,
 )
+from utils.log import logger
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
@@ -123,19 +123,59 @@ def legacy_usage(prompt: object, text: str, model: str) -> dict[str, int]:
     return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+def stream_text_chat_completion(
+    backend,
+    messages: list[dict[str, Any]],
+    model: str,
+    tools: list[dict[str, Any]] | None = None,
+    body: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
     request = ConversationRequest(model=model, messages=messages)
+    full_text = ""
     for delta_text in stream_text_deltas(backend, request):
-        if not sent_role:
-            sent_role = True
-            yield completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
-        else:
-            yield completion_chunk(model, {"content": delta_text}, None, completion_id, created)
+        full_text += delta_text
+        if not tools:
+            if not sent_role:
+                sent_role = True
+                yield completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
+            else:
+                yield completion_chunk(model, {"content": delta_text}, None, completion_id, created)
+    # Parse tool calls from collected text if tools were provided
+    if tools and body:
+        allowed = tool_names_from_body(body)
+        tool_calls = parse_tool_calls(full_text, allowed)
+        # Auto-retry if model returned text instead of tool_calls
+        if not tool_calls and should_force_tool_retry(full_text, allowed):
+            logger.info("agent_protocol: streaming model returned text instead of tool_calls, retrying with strict prompt")
+            strict_hint = build_tool_call_system_message(tools, strict_retry=True)
+            strict_messages = messages.copy()
+            insert_system_hint(strict_messages, strict_hint)
+            strict_request = ConversationRequest(model=model, messages=strict_messages)
+            retry_text = collect_text(backend, strict_request)
+            tool_calls = parse_tool_calls(retry_text, allowed)
+            if tool_calls:
+                full_text = retry_text
+        if tool_calls:
+            # Emit tool call chunks in OpenAI streaming format
+            for idx, tc in enumerate(tool_calls):
+                fn = tc.get("function", {})
+                delta_tc = {
+                    "index": idx,
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "{}")},
+                }
+                yield completion_chunk(model, {"tool_calls": [delta_tc]}, None, completion_id, created)
+            yield completion_chunk(model, {}, "tool_calls", completion_id, created)
+            return
     if not sent_role:
-        yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
+        yield completion_chunk(model, {"role": "assistant", "content": full_text or ""}, None, completion_id, created)
+    elif tools and full_text and not tool_calls:
+        # tools present but no tool calls parsed — emit remaining text
+        pass
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
@@ -178,41 +218,38 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
     return model, prompt, parse_image_count(body.get("n")), images
 
 
-def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None]:
     model = str(body.get("model") or "auto").strip() or "auto"
     raw_messages = prepare_agent_messages(chat_messages_from_body(body))
     messages = normalize_text_messages(normalize_messages(raw_messages))
-    tools = body.get("tools")
-    if isinstance(tools, list) and tools:
-        last_user = next((str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"), "")
-        phase_hint = build_phase_system_message(last_user, tool_names_from_body(body))
-        if phase_hint:
-            insert_system_hint(messages, phase_hint)
+    tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+    if tools:
         insert_system_hint(messages, build_tool_call_system_message(tools))
     if wants_json_mode(body):
         insert_system_hint(messages, JSON_MODE_SYSTEM_MESSAGE)
-    return model, messages
+    return model, messages, tools
 
 def text_chat_response(body: dict[str, Any]) -> dict[str, Any]:
-    model, messages = text_chat_parts(body)
-    allowed_tool_names = tool_names_from_body(body)
+    model, messages, tools = text_chat_parts(body)
     key = cache_key(body, messages, stream=False)
 
     def compute() -> dict[str, Any]:
         content = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
-        tool_calls = parse_tool_calls(content, allowed_tool_names)
-        if not tool_calls and should_force_tool_retry(content, allowed_tool_names):
-            # Show the model its own invalid reply plus a corrective instruction,
-            # which works far better than repeating the system prompt blindly.
-            retry_messages = list(messages) + [
-                {"role": "assistant", "content": content},
-                {"role": "user", "content": build_tool_call_system_message(body.get("tools"), strict_retry=True)},
-            ]
-            content = collect_text(text_backend(), ConversationRequest(model=model, messages=retry_messages))
-            tool_calls = parse_tool_calls(content, allowed_tool_names)
-        if not tool_calls and allowed_tool_names:
-            content = strip_raw_tool_json(content).strip() or content
-        return completion_response(model, "" if tool_calls else content, messages=messages, tool_calls=tool_calls)
+        tool_calls = None
+        if tools:
+            allowed = tool_names_from_body(body)
+            tool_calls = parse_tool_calls(content, allowed)
+            # Auto-retry if model returned text instead of tool_calls
+            if not tool_calls and should_force_tool_retry(content, allowed):
+                logger.info("agent_protocol: model returned text instead of tool_calls, retrying with strict prompt")
+                strict_hint = build_tool_call_system_message(tools, strict_retry=True)
+                strict_messages = messages.copy()
+                insert_system_hint(strict_messages, strict_hint)
+                content = collect_text(text_backend(), ConversationRequest(model=model, messages=strict_messages))
+                tool_calls = parse_tool_calls(content, allowed)
+            if tool_calls:
+                content = strip_raw_tool_json(content) or None
+        return completion_response(model, content, messages=messages, tool_calls=tool_calls)
 
     return chat_completion_cache.get_or_compute_response(key, compute)
 
@@ -285,11 +322,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)
-        model, messages = text_chat_parts(body)
+        model, messages, tools = text_chat_parts(body)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, tools, body),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
